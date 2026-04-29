@@ -1,29 +1,24 @@
 import os
-import math
 import asyncio
-import logging
+import math
+from datetime import datetime
 from collections import deque
+
 import numpy as np
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import neurokit2 as nk
+import uvicorn
+from dotenv import load_dotenv
+from google import genai
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from pydantic import BaseModel
 
-# Setup basic logging to catch errors instead of swallowing them silently
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# 1. Initialize the LLM Agent
-# Pull the API key from environment variables for security. 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    logger.warning("GEMINI_API_KEY environment variable is missing!")
-
-genai.configure(api_key=GEMINI_API_KEY)
-llm_model = genai.GenerativeModel('gemini-1.5-flash')
+# 1. SETUP & SECURITY
+load_dotenv()
+llm_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 app = FastAPI(title="Hybrid AI Synchrony Backend")
 
-# Allow the React frontend to talk to the FastAPI backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -32,124 +27,157 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- WebSocket Manager ---
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: list[WebSocket] = []
+# 2. STATE & CONFIGURATION
+WINDOW_SIZE = 3000 
+participant_buffers = {1: deque(maxlen=WINDOW_SIZE), 2: deque(maxlen=WINDOW_SIZE), 3: deque(maxlen=WINDOW_SIZE)}
+last_inference_time = {1: 0, 2: 0, 3: 0}
+rmssd_history = {1: [], 2: [], 3: []}
+current_stress_states = {1: "Waiting...", 2: "Waiting...", 3: "Waiting..."}
+last_intervention_time = 0
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+# Store the main event loop globally to access it from background threads
+main_loop = None
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+class SensorData(BaseModel):
+    participant_id: int
+    ppg_samples: list[float]
 
-    async def broadcast(self, message: dict):
-        """Pushes real-time JSON data to the React dashboard"""
-        for connection in self.active_connections:
-            try:
-                await connection.send_json(message)
-            except Exception as e:
-                logger.error(f"Failed to send to a websocket client: {e}")
-
-manager = ConnectionManager()
+# 3. WEBSOCKET FOR DASHBOARD
+active_websockets = []
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await websocket.accept()
+    active_websockets.append(websocket)
     try:
         while True:
-            await websocket.receive_text() # Keeps the pipe open
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
+            await websocket.receive_text()
+    except Exception:
+        if websocket in active_websockets:
+            active_websockets.remove(websocket)
 
+async def broadcast_to_dashboard(message_dict):
+    """Pushes real-time JSON data to all connected dashboard tabs"""
+    for connection in active_websockets:
+        try:
+            await connection.send_json(message_dict)
+        except Exception:
+            pass
 
-# ... [Keep your WINDOW_SIZE, buffers, and classify_stress_clinically function exactly as they were] ...
+def safe_broadcast(data):
+    """Safely bridges the thread gap to send data to the WebSocket"""
+    if main_loop:
+        main_loop.call_soon_threadsafe(
+            lambda: asyncio.create_task(broadcast_to_dashboard(data))
+        )
 
+# 4. CLINICAL HRV ANALYSIS
+def classify_stress_clinically(rmssd, sdnn, hr, pnn50):
+    scores = {"Calm": 0, "Mild Stress": 0, "High Stress": 0}
+    if rmssd > 50: scores["Calm"] += 1
+    elif 20 <= rmssd <= 50: scores["Mild Stress"] += 1
+    else: scores["High Stress"] += 1
 
-def generate_dynamic_message(team_state: str, style: str) -> str:
-    """Calls Gemini to generate a unique, context-aware intervention."""
-    prompt = (
-        f"You are an AI assistant helping a team of 3 people collaborate on a complex puzzle. "
-        f"Right now, the team is {team_state}. "
-        f"Write a single, short sentence to display on their screen to help them. "
-        f"The tone must be {style}. Be natural and human-like. Do not be robotic."
-    )
-    
+    if sdnn > 50: scores["Calm"] += 1
+    elif 30 <= sdnn <= 50: scores["Mild Stress"] += 1
+    else: scores["High Stress"] += 1
+
+    if 60 <= hr <= 75: scores["Calm"] += 1
+    elif 76 <= hr <= 90: scores["Mild Stress"] += 1
+    else: scores["High Stress"] += 1
+
+    if pnn50 > 20: scores["Calm"] += 1
+    elif 5 <= pnn50 <= 20: scores["Mild Stress"] += 1
+    else: scores["High Stress"] += 1
+    return max(scores, key=scores.get)
+
+# 5. HYBRID AI AGENT (LLM)
+def generate_dynamic_message(team_state: str, style: str):
+    prompt = f"You are an AI assistant helping a team of 3 solve a puzzle. The team is {team_state}. Write one short, natural sentence to help them. Tone: {style}."
     try:
-        response = llm_model.generate_content(prompt)
+        response = llm_client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
         return response.text.strip()
     except Exception as e:
-        logger.error(f"LLM Error: {e}")
-        return "Let's take a quick pause to sync up, team!" # Fallback message
-
-
-def safe_correlation(p_a, p_b):
-    """Helper to calculate correlation and handle NaNs cleanly."""
-    corr = np.corrcoef(p_a, p_b)[0, 1]
-    return 0 if math.isnan(corr) else corr
-
+        print(f"LLM Error: {e}")
+        return "Let's take a quick moment to regroup, team."
 
 def calculate_synchrony_and_intervene():
     global last_intervention_time
-    
-    # Ensure we have enough data to calculate
-    if any(len(rmssd_history[i]) < 3 for i in (1, 2, 3)):
+    if len(rmssd_history[1]) < 3 or len(rmssd_history[2]) < 3 or len(rmssd_history[3]) < 3:
         return
 
-    p1, p2, p3 = rmssd_history[1][-3:], rmssd_history[2][-3:], rmssd_history[3][-3:]
-
     try:
-        # Calculate group synchrony
-        sync_12 = safe_correlation(p1, p2)
-        sync_13 = safe_correlation(p1, p3)
-        sync_23 = safe_correlation(p2, p3)
+        p1, p2, p3 = rmssd_history[1][-3:], rmssd_history[2][-3:], rmssd_history[3][-3:]
+        sync_12 = np.nan_to_num(np.corrcoef(p1, p2)[0, 1])
+        sync_13 = np.nan_to_num(np.corrcoef(p1, p3)[0, 1])
+        sync_23 = np.nan_to_num(np.corrcoef(p2, p3)[0, 1])
         group_sync = np.mean([sync_12, sync_13, sync_23])
         
-        current_time = asyncio.get_event_loop().time()
-        
-        # Cooldown check (120 seconds)
-        if current_time - last_intervention_time < 120:
-            return
-
-        # Determine if an intervention is needed
-        trigger_type = None
-        team_state = ""
-        style = ""
-
-        if "High Stress" in current_stress_states.values():
-            trigger_type = "Individual High Stress"
-            team_state = "experiencing high cognitive load and stress"
-            style = "calming, empathetic, and brief"
-            
-        elif group_sync < 0.30:
-            trigger_type = "Low Team Synchrony"
-            team_state = "working independently and not communicating well"
-            style = "encouraging, collaborative, and directive"
-
-        # Execute the intervention if a trigger condition was met
-        if trigger_type:
-            logger.info(f"\n>> HYBRID AI: {trigger_type} Detected!")
-            logger.info(">> Asking LLM to generate an intervention...")
-            
-            message = generate_dynamic_message(team_state, style)
-            logger.info(f">> AI SAYS: '{message}'\n")
-            
-            last_intervention_time = current_time
-            
-            # Send the AI message to the React Dashboard instantly safely
-            payload = {
-                "type": "intervention",
-                "trigger": trigger_type,
-                "message": message
-            }
-            asyncio.run_coroutine_threadsafe(
-                manager.broadcast(payload),
-                asyncio.get_event_loop()
-            )
-            
+        # WE USE 1.1 TO FORCE A TRIGGER FOR TONIGHT'S TEST
+        if (datetime.now().timestamp() - last_intervention_time) > 60: # 1 min cooldown
+            msg, trig = None, None
+            if "High Stress" in current_stress_states.values():
+                msg = generate_dynamic_message("stressed", "calming")
+                trig = "High Stress"
+            elif group_sync < 1.1: 
+                msg = generate_dynamic_message("needing sync", "supportive")
+                trig = "Sync Check"
+                
+            if msg:
+                print(f"\n>> AI INTERVENTION: {msg}")
+                last_intervention_time = datetime.now().timestamp()
+                safe_broadcast({"type": "intervention", "trigger": trig, "message": msg})
     except Exception as e:
-        logger.error(f"Error calculating synchrony: {e}")
+        print(f"Sync Error: {e}")
 
-# ... [Keep your process_hrv and receive_data functions exactly as they were] ...
+# 6. DATA PROCESSING
+def process_hrv(participant_id: int, raw_window: np.ndarray):
+    try:
+        signals, info = nk.ppg_process(raw_window, sampling_rate=50)
+        if len(info['PPG_Peaks']) > 3:
+            hrv_time = nk.hrv_time(info['PPG_Peaks'], sampling_rate=50)
+            rmssd = float(hrv_time['HRV_RMSSD'].values[0])
+            sdnn = float(hrv_time['HRV_SDNN'].values[0])
+            pnn50 = float(hrv_time['HRV_pNN50'].values[0])
+            hr = float(np.mean(signals['PPG_Rate']))
+            
+            stress_state = classify_stress_clinically(rmssd, sdnn, hr, pnn50)
+            rmssd_history[participant_id].append(rmssd)
+            current_stress_states[participant_id] = stress_state
+            
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] P{participant_id} | {stress_state} | RMSSD: {rmssd:.1f}ms")
+            
+            # SEND LIVE STATS TO DASHBOARD
+            safe_broadcast({
+                "type": "live_stats",
+                "participant_id": participant_id,
+                "stress": stress_state,
+                "rmssd": round(rmssd, 2)
+            })
+
+            if participant_id == 3:
+                calculate_synchrony_and_intervene()
+    except Exception as e:
+        print(f"Analysis Error P{participant_id}: {e}")
+
+# 7. ROUTES
+@app.on_event("startup")
+async def startup_event():
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+
+@app.post("/sensor-data")
+async def receive_data(data: SensorData, background_tasks: BackgroundTasks):
+    pid = data.participant_id
+    if pid not in [1, 2, 3]: return {"error": "Invalid PID"}
+    participant_buffers[pid].extend(data.ppg_samples)
+    
+    if len(participant_buffers[pid]) == WINDOW_SIZE:
+        curr_t = datetime.now().timestamp()
+        if curr_t - last_inference_time[pid] >= 10.0:
+            last_inference_time[pid] = curr_t
+            background_tasks.add_task(process_hrv, pid, np.array(participant_buffers[pid]))
+    return {"status": "buffered"}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
